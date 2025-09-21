@@ -1,0 +1,1 @@
+# terraform-ecs-react-app-clean
