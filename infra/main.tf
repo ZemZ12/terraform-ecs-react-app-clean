@@ -8,74 +8,6 @@ terraform {
   }
 }
 
-#####################################
-# Variables (multi-line, safe style)
-#####################################
-variable "project" {
-  type    = string
-  default = "wisam-webapp"
-}
-
-variable "aws_region" {
-  type    = string
-  default = "us-east-1"
-}
-
-variable "vpc_cidr" {
-  type    = string
-  default = "10.10.0.0/16"
-}
-
-variable "public_subnets" {
-  type    = list(string)
-  default = ["10.10.1.0/24", "10.10.2.0/24"]
-}
-
-variable "key_name" {
-  type    = string
-  default = "wisam-key"
-}
-
-variable "my_ip_cidr" {
-  type    = string
-  default = "0.0.0.0/0" # replace with YOUR.IP/32 for SSH
-}
-
-variable "app_image" {
-  type    = string
-  default = "nginxdemos/hello:latest"
-}
-
-variable "container_port" {
-  type    = number
-  default = 80
-}
-
-variable "container_env" {
-  type    = map(string)
-  default = { ENV = "prod" }
-}
-
-variable "instance_type" {
-  type    = string
-  default = "t3.micro"
-}
-
-variable "desired_cap" {
-  type    = number
-  default = 2
-}
-
-variable "min_cap" {
-  type    = number
-  default = 2
-}
-
-variable "max_cap" {
-  type    = number
-  default = 4
-}
-
 provider "aws" {
   region = var.aws_region
 }
@@ -142,24 +74,17 @@ resource "aws_security_group" "alb_sg" {
   tags = { Name = "${var.project}-alb-sg" }
 }
 
-resource "aws_security_group" "ec2_sg" {
-  name   = "${var.project}-ec2-sg"
+# SG for ECS tasks (allow HTTP from ALB only is ideal; demo allows 0.0.0.0/0)
+resource "aws_security_group" "ecs_service_sg" {
+  name   = "${var.project}-ecs-sg"
   vpc_id = aws_vpc.this.id
 
   ingress {
-    description     = "App from ALB"
-    from_port       = var.container_port
-    to_port         = var.container_port
-    protocol        = "tcp"
-    security_groups = [aws_security_group.alb_sg.id]
-  }
-
-  ingress {
-    description = "SSH from my IP"
-    from_port   = 22
-    to_port     = 22
+    from_port   = 80
+    to_port     = 80
     protocol    = "tcp"
-    cidr_blocks = [var.my_ip_cidr]
+    cidr_blocks = ["0.0.0.0/0"] # tighten to ALB SG if you prefer
+    # security_groups = [aws_security_group.alb_sg.id]  # alternative stricter rule
   }
 
   egress {
@@ -169,11 +94,11 @@ resource "aws_security_group" "ec2_sg" {
     cidr_blocks = ["0.0.0.0/0"]
   }
 
-  tags = { Name = "${var.project}-ec2-sg" }
+  tags = { Name = "${var.project}-ecs-sg" }
 }
 
 ############################
-# ALB + target group + listener
+# ALB + TG + Listener
 ############################
 resource "aws_lb" "app" {
   name               = "${var.project}-alb"
@@ -183,11 +108,12 @@ resource "aws_lb" "app" {
   tags               = { Name = "${var.project}-alb" }
 }
 
+# FARGATE needs target_type = "ip"
 resource "aws_lb_target_group" "app_tg" {
   name        = "${var.project}-tg"
   port        = var.container_port
   protocol    = "HTTP"
-  target_type = "instance"
+  target_type = "ip"
   vpc_id      = aws_vpc.this.id
 
   health_check {
@@ -215,74 +141,96 @@ resource "aws_lb_listener" "http" {
 }
 
 ############################
-# Launch template (Docker)
+# ECR repository
 ############################
-data "aws_ami" "al2023" {
-  owners      = ["137112412989"] # Amazon
-  most_recent = true
-  filter {
-    name   = "name"
-    values = ["al2023-ami-*-x86_64"]
-  }
-}
-
-locals {
-  env_exports = join("\n", [for k, v in var.container_env : "export ${k}='${v}'"])
-}
-
-resource "aws_launch_template" "lt" {
-  name_prefix            = "${var.project}-lt-"
-  image_id               = data.aws_ami.al2023.id
-  instance_type          = var.instance_type
-  key_name               = var.key_name
-  vpc_security_group_ids = [aws_security_group.ec2_sg.id]
-
-  user_data = base64encode(<<-EOF
-    #!/bin/bash
-    dnf -y update
-    dnf -y install docker
-    systemctl enable --now docker
-
-    ${local.env_exports}
-
-    docker run -d --restart=always \
-      -p ${var.container_port}:${var.container_port} \
-      --name app "${var.app_image}"
-  EOF
-  )
-
-  tag_specifications {
-    resource_type = "instance"
-    tags          = { Name = "${var.project}-app" }
-  }
+resource "aws_ecr_repository" "app" {
+  name                 = "react-nginx"
+  image_tag_mutability = "MUTABLE"
+  force_delete         = true
 }
 
 ############################
-# Auto Scaling Group
+# ECS (Fargate) Cluster/Task/Service
 ############################
-resource "aws_autoscaling_group" "asg" {
-  name                = "${var.project}-asg"
-  max_size            = var.max_cap
-  min_size            = var.min_cap
-  desired_capacity    = var.desired_cap
-  vpc_zone_identifier = [for s in aws_subnet.public : s.id]
-  health_check_type   = "EC2"
-  target_group_arns   = [aws_lb_target_group.app_tg.arn]
+resource "aws_ecs_cluster" "app" {
+  name = "react-app-cluster"
+}
 
-  launch_template {
-    id      = aws_launch_template.lt.id
-    version = "$Latest"
+resource "aws_cloudwatch_log_group" "app" {
+  name              = "/ecs/react-nginx"
+  retention_in_days = 14
+}
+
+data "aws_iam_policy_document" "ecs_task_assume" {
+  statement {
+    actions = ["sts:AssumeRole"]
+
+    principals {
+      type        = "Service"
+      identifiers = ["ecs-tasks.amazonaws.com"]
+    }
+  }
+}
+
+resource "aws_iam_role" "ecs_task_exec" {
+  name               = "ecsTaskExecutionRole-react"
+  assume_role_policy = data.aws_iam_policy_document.ecs_task_assume.json
+}
+
+resource "aws_iam_role_policy_attachment" "ecs_task_exec_attach" {
+  role       = aws_iam_role.ecs_task_exec.name
+  policy_arn = "arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy"
+}
+
+resource "aws_ecs_task_definition" "app" {
+  family                   = "react-app-task"
+  requires_compatibilities = ["FARGATE"]
+  network_mode             = "awsvpc"
+  cpu                      = "256"
+  memory                   = "512"
+  execution_role_arn       = aws_iam_role.ecs_task_exec.arn
+
+  container_definitions = jsonencode([
+    {
+      name      = "react-app"
+      image     = "${aws_ecr_repository.app.repository_url}:${var.image_tag}"
+      essential = true
+      portMappings = [
+        { containerPort = 80, hostPort = 80, protocol = "tcp" }
+      ]
+      logConfiguration = {
+        logDriver = "awslogs",
+        options = {
+          awslogs-region        = var.aws_region,
+          awslogs-group         = aws_cloudwatch_log_group.app.name,
+          awslogs-stream-prefix = "ecs"
+        }
+      }
+    }
+  ])
+}
+
+resource "aws_ecs_service" "app" {
+  name                 = "react-app-service"
+  cluster              = aws_ecs_cluster.app.id
+  task_definition      = aws_ecs_task_definition.app.arn
+  desired_count        = 1
+  launch_type          = "FARGATE"
+  force_new_deployment = true
+
+  network_configuration {
+    subnets          = [for s in aws_subnet.public : s.id]
+    security_groups  = [aws_security_group.ecs_service_sg.id]
+    assign_public_ip = true
   }
 
-  lifecycle {
-    create_before_destroy = true
+  load_balancer {
+    target_group_arn = aws_lb_target_group.app_tg.arn
+    container_name   = "react-app"
+    container_port   = 80
   }
 
-  tag {
-    key                 = "Name"
-    value               = "${var.project}-app"
-    propagate_at_launch = true
-  }
+  depends_on = [aws_lb_listener.http]
 }
 
 ############################
@@ -292,3 +240,5 @@ output "alb_dns_name" {
   description = "Public URL of the load balancer"
   value       = aws_lb.app.dns_name
 }
+
+
